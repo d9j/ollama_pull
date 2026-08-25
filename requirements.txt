@@ -1,0 +1,4 @@
+httpx>=0.27,<1
+tenacity>=8.2,<10
+filelock>=3.13,<4
+rich>=13.7,<15
