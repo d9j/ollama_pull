@@ -1,6 +1,6 @@
 # Ollama Model Downloader
 
-A cross-platform Python downloader for models hosted on the Ollama registry.
+A reliable, cross-platform Python downloader for models hosted on the Ollama registry.
 
 It downloads Ollama manifests and blobs directly, supports interrupted-download resume, verifies SHA-256 checksums, and installs models into Ollama's normal local model store.
 
@@ -8,29 +8,37 @@ It downloads Ollama manifests and blobs directly, supports interrupted-download 
 
 - Works on macOS, Linux, and Windows
 - No OS-specific shell commands
-- Uses a small reliability-focused dependency set
-- HTTP connection pooling and streaming via `httpx`
-- Retry/backoff with jitter via `tenacity`
-- Cross-process blob locking via `filelock`
-- Download progress display via `rich`
-- Supports normal Ollama model references such as `qwen3.8:27b`
-- Automatically downloads the model manifest and all required blobs
-- Resumes interrupted blob downloads using HTTP `Range` requests
-- Automatically retries interrupted downloads
-- Verifies every completed blob with SHA-256
-- Detects and skips already-complete valid blobs
-- Uses `$OLLAMA_MODELS` when set
+- Resumable downloads using HTTP `Range`
+- Validates `Content-Range` before resuming
+- Retries transient network failures automatically
+- Retries transient HTTP errors such as `408`, `425`, `429`, `500`, `502`, `503`, and `504`
+- Uses randomized exponential backoff
+- Verifies completed blobs with SHA-256
+- Detects and skips already-valid blobs
+- Uses per-blob file locks to prevent concurrent corruption
+- Rich terminal progress bars with speed and ETA
+- Uses `$OLLAMA_MODELS` when configured
 - Otherwise defaults to `~/.ollama/models`
-- Supports a custom model directory
-- Supports a custom Ollama-compatible registry
+- Supports custom model directories
+- Supports custom Ollama-compatible registries
 
 ## Requirements
 
-- Python 3.9 or newer recommended
-- Network access to the Ollama registry
-- Ollama installed if you want to run the downloaded model afterward
+Python 3.9 or newer is recommended.
 
-Python dependencies are listed in `requirements.txt`:
+Install the required Python packages:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+On systems where Python is installed as `python3`:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+The project uses:
 
 ```text
 httpx
@@ -39,52 +47,40 @@ filelock
 rich
 ```
 
-Install them with:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-On systems where the Python executable is named `python3`:
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-## Download
-
-Save the script as:
+## Files
 
 ```text
-ollama_download.py
+main.py
+requirements.txt
+README.md
 ```
 
 ## Basic Usage
 
-Download a model:
+Download an Ollama model:
 
 ```bash
-python ollama_download.py qwen3.8:27b
+python main.py qwen3.8:27b
 ```
 
-On macOS or Linux you may use:
+On macOS or Linux:
 
 ```bash
-python3 ollama_download.py qwen3.8:27b
+python3 main.py qwen3.8:27b
 ```
 
 Other examples:
 
 ```bash
-python ollama_download.py llama3.2:3b
-python ollama_download.py deepseek-r1:32b
-python ollama_download.py qwen3.8:27b
+python main.py llama3.2:3b
+python main.py deepseek-r1:32b
+python main.py qwen3.8:27b
 ```
 
 If no tag is supplied, `latest` is used:
 
 ```bash
-python ollama_download.py llama3.2
+python main.py llama3.2
 ```
 
 ## Resume Support
@@ -99,10 +95,10 @@ If the download is interrupted by:
 - system reboot
 - timeout
 
-just run the same command again:
+run the same command again:
 
 ```bash
-python ollama_download.py qwen3.8:27b
+python3 main.py qwen3.8:27b
 ```
 
 Incomplete blobs are stored with a `.part` suffix, for example:
@@ -111,51 +107,60 @@ Incomplete blobs are stored with a `.part` suffix, for example:
 sha256-0123456789abcdef.part
 ```
 
-On the next run, the downloader checks the existing partial size and requests the remaining bytes using an HTTP `Range` request.
+The downloader checks the partial file size and requests the remaining bytes using HTTP `Range`.
 
-After the blob finishes downloading, the script verifies its SHA-256 checksum before installing it.
-
-For resumed requests, the downloader validates both:
+For resumed requests it validates:
 
 - HTTP status `206 Partial Content`
 - the returned `Content-Range`
 
-If the server does not honor the resume request correctly, that individual blob is restarted from the beginning rather than appending unsafe data.
+If the server does not return a valid resume response, that individual blob is restarted safely instead of appending potentially invalid data.
 
-A per-blob file lock also prevents two downloader processes from writing the same partial blob simultaneously.
+After the download completes, the blob is verified using SHA-256 before being moved into its final Ollama blob filename.
 
-## Reliability
+## Retry Behavior
 
-The downloader uses:
+By default, retries are unlimited.
 
-- `httpx.Client` for persistent HTTP connections, streaming, redirects, proxies, and separate connection/read/pool timeouts
-- `tenacity` for retries with randomized exponential backoff
-- `filelock` to protect blobs from concurrent writers
-- `rich` for byte-aware progress reporting
-
-Transient HTTP statuses are retried automatically, including:
+The downloader retries common temporary failures including:
 
 ```text
-408
-425
-429
-500
-502
-503
-504
+408 Request Timeout
+425 Too Early
+429 Too Many Requests
+500 Internal Server Error
+502 Bad Gateway
+503 Service Unavailable
+504 Gateway Timeout
 ```
 
-Network interruptions such as connection errors, read errors, and timeouts are also retried.
+It also retries connection errors, read errors, timeouts, protocol errors, and similar transient failures.
 
-By default retries are unlimited. Use `--retries` to limit them.
+Retries use randomized exponential backoff.
+
+To limit retries:
+
+```bash
+python3 main.py qwen3.8:27b --retries 10
+```
+
+To disable retrying:
+
+```bash
+python3 main.py qwen3.8:27b --retries 0
+```
 
 ## Default Model Directory
 
-The downloader first checks the `OLLAMA_MODELS` environment variable.
+The downloader first checks:
 
-If it is defined, that directory is used.
+```text
+OLLAMA_MODELS
+```
 
-Otherwise the script uses:
+If `OLLAMA_MODELS` is set, that directory is used.
+
+Otherwise it defaults to:
 
 ```text
 ~/.ollama/models
@@ -181,18 +186,20 @@ Examples:
 C:\Users\alexdev\.ollama\models
 ```
 
+No operating-system-specific logic is required.
+
 ## Custom Model Directory
 
-You can override the destination directory:
+Specify another Ollama model store with:
 
 ```bash
-python ollama_download.py qwen3.8:27b --models-dir /mnt/ollama/models
+python3 main.py qwen3.8:27b --models-dir /mnt/ollama/models
 ```
 
 Windows example:
 
 ```powershell
-python ollama_download.py qwen3.8:27b --models-dir "D:\ollama\models"
+python main.py qwen3.8:27b --models-dir "D:\ollama\models"
 ```
 
 ## Custom Registry
@@ -203,61 +210,72 @@ The default registry is:
 https://registry.ollama.ai
 ```
 
-To use another compatible registry:
+To use another Ollama-compatible registry:
 
 ```bash
-python ollama_download.py mymodel:latest --registry https://example.com
+python3 main.py mymodel:latest --registry https://example.com
 ```
 
-## Retry Behavior
+## Timeouts
 
-By default, interrupted blob downloads retry indefinitely.
-
-To limit the number of retries per blob:
-
-```bash
-python ollama_download.py qwen3.8:27b --retries 10
-```
-
-Use:
+Default connection timeout:
 
 ```text
---retries -1
+30 seconds
 ```
 
-for unlimited retries.
+Default read inactivity timeout:
 
-## HTTP Timeout
+```text
+120 seconds
+```
 
-The default HTTP timeout is 60 seconds.
+Default connection-pool timeout:
+
+```text
+30 seconds
+```
+
+Override them with:
+
+```bash
+python3 main.py qwen3.8:27b \
+  --connect-timeout 60 \
+  --read-timeout 300 \
+  --pool-timeout 60
+```
+
+## Concurrent Download Protection
+
+Each blob uses a file lock.
+
+If two downloader processes try to download the same blob simultaneously, only one process is allowed to write it.
+
+This helps prevent `.part` file corruption.
+
+The default lock wait is 5 seconds.
 
 Override it with:
 
 ```bash
-python ollama_download.py qwen3.8:27b --timeout 120
-```
-
-## Command-Line Help
-
-```bash
-python ollama_download.py --help
+python3 main.py qwen3.8:27b --lock-timeout 30
 ```
 
 ## What Gets Installed
 
-The downloader writes blobs into:
+Blobs are written to:
 
 ```text
 <models-dir>/blobs/
 ```
 
-and manifests into:
+Manifests are written to:
 
 ```text
 <models-dir>/manifests/<registry>/<repository>/<tag>
 ```
 
-For example:
+Example:
 
 ```text
 ~/.ollama/models/
@@ -271,7 +289,7 @@ For example:
                 └── 27b
 ```
 
-This is the same general layout Ollama uses for locally stored registry models.
+The manifest is installed only after all required blobs have downloaded and passed verification.
 
 ## After Download
 
@@ -281,7 +299,7 @@ Check that Ollama sees the model:
 ollama list
 ```
 
-Run it:
+Run the model:
 
 ```bash
 ollama run qwen3.8:27b
@@ -291,47 +309,40 @@ ollama run qwen3.8:27b
 
 For every blob, the downloader:
 
-1. Checks whether a complete local blob already exists.
-2. Verifies its expected file size.
-3. Verifies the SHA-256 checksum.
-4. Downloads or resumes the blob when required.
-5. Verifies the completed `.part` file.
-6. Renames it to the final Ollama blob filename only after successful verification.
+1. Checks whether a local final blob already exists.
+2. Checks its expected size.
+3. Verifies its SHA-256 checksum.
+4. Resumes a partial `.part` file when possible.
+5. Validates HTTP resume responses.
+6. Verifies the completed `.part` file.
+7. Atomically moves it into the final Ollama blob filename.
 
-The model manifest is installed only after all required blobs have completed successfully.
+A corrupted completed blob is not accepted.
 
-## Interrupted Downloads
+## Command-Line Help
 
-If you intentionally stop the downloader with Ctrl+C:
-
-```text
-Interrupted. Run the same command again to resume.
+```bash
+python3 main.py --help
 ```
 
-Simply rerun the original command.
-
-Do not delete the `.part` files if you want to resume.
-
-## Notes
-
-- Resume requires the remote registry/blob server to support HTTP byte-range requests.
-- Large models may require substantial free disk space.
-- The downloader does not start or stop the Ollama server.
-- Ollama and this downloader should point to the same model directory.
-- If you use `OLLAMA_MODELS`, make sure Ollama itself is configured with the same value.
-
 ## Example: qwen3.8:27b
+
+Install dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
 
 Download:
 
 ```bash
-python ollama_download.py qwen3.8:27b
+python3 main.py qwen3.8:27b
 ```
 
-If interrupted:
+If interrupted, run the same command again:
 
 ```bash
-python ollama_download.py qwen3.8:27b
+python3 main.py qwen3.8:27b
 ```
 
 Then run:
@@ -340,6 +351,11 @@ Then run:
 ollama run qwen3.8:27b
 ```
 
-## License
+## Notes
 
-Use and modify the script as needed. Models downloaded with it remain subject to their own licenses and usage terms.
+- Resume depends on the registry/blob server supporting HTTP byte-range requests.
+- Large models require substantial free disk space.
+- The downloader does not start or stop the Ollama server.
+- Ollama and this downloader should point to the same model directory.
+- If you use `OLLAMA_MODELS`, make sure Ollama itself uses the same value.
+- Models remain subject to their own licenses and usage terms.
