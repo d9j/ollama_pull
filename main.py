@@ -29,7 +29,6 @@ import json
 import math
 import os
 import re
-import shutil
 import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -58,6 +57,7 @@ from tenacity import (
     stop_never,
     wait_random_exponential,
 )
+from aria2_backend import Aria2Backend, Aria2Error
 
 
 DEFAULT_REGISTRY = "https://registry.ollama.ai"
@@ -86,6 +86,7 @@ _AUTH_RE = re.compile(r'(\w+)="([^"]*)"')
 _CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$", re.I)
 
 console = Console()
+error_console = Console(file=sys.stderr)
 
 
 class RetryableHTTPStatus(httpx.HTTPStatusError):
@@ -376,7 +377,12 @@ class RegistryClient:
                 response=httpx.Response(
                     status,
                     request=request,
-                    reason_phrase=reason,
+                    extensions={
+                        "reason_phrase": reason.encode(
+                            "ascii",
+                            errors="replace",
+                        ),
+                    },
                 ),
             )
 
@@ -411,13 +417,63 @@ class RegistryClient:
     ) -> httpx.Response:
         return self.request(
             "GET",
-            f"{self.base_url}/v2/{self.repo}/blobs/{digest}",
+            self.blob_url(digest),
             headers={
                 "Accept-Encoding": "identity",
                 "Range": f"bytes={start}-{end}",
             },
             stream=True,
         )
+
+    def blob_url(self, digest: str) -> str:
+        return f"{self.base_url}/v2/{self.repo}/blobs/{digest}"
+
+    def resolve_blob_for_aria2(
+        self,
+        digest: str,
+    ) -> Tuple[str, Dict[str, str]]:
+        """Resolve auth and redirects before handing a blob to aria2c.
+
+        A one-byte ranged request makes the registry perform its normal Bearer
+        challenge and redirect flow without downloading the blob body. If the
+        final URL is on another origin, the Bearer token is deliberately not
+        passed to aria2c because aria2 forwards custom headers across
+        redirects.
+        """
+        response = self.request(
+            "GET",
+            self.blob_url(digest),
+            headers={
+                "Accept-Encoding": "identity",
+                "Range": "bytes=0-0",
+            },
+            stream=True,
+        )
+
+        try:
+            resolved_url = str(response.url)
+        finally:
+            response.close()
+
+        source = urlparse(self.base_url)
+        resolved = urlparse(resolved_url)
+        headers = {
+            "Accept-Encoding": "identity",
+            "User-Agent": USER_AGENT,
+        }
+
+        same_origin = (
+            source.scheme.lower(),
+            source.netloc.lower(),
+        ) == (
+            resolved.scheme.lower(),
+            resolved.netloc.lower(),
+        )
+
+        if same_origin:
+            headers.update(self._authorization_headers())
+
+        return resolved_url, headers
 
 
 RETRYABLE_EXCEPTIONS = (
@@ -911,6 +967,61 @@ def merge_and_verify_segments(
     console.print("  [bold green]OK[/]")
 
 
+def download_blob_with_aria2(
+    client: RegistryClient,
+    aria2_backend: Aria2Backend,
+    digest: str,
+    expected_size: int,
+    expected_hash: str,
+    final_path: Path,
+    legacy_part_path: Path,
+    retries: int,
+    range_size: int,
+    connections: int,
+    connect_timeout: float,
+    read_timeout: float,
+) -> None:
+    """Download and verify one blob through the optional aria2 backend."""
+    url, headers = client.resolve_blob_for_aria2(digest)
+
+    console.print(
+        f"  [cyan]Using aria2c:[/] {connections} connections"
+    )
+
+    aria2_backend.download(
+        url,
+        legacy_part_path,
+        expected_size=expected_size,
+        expected_hash=expected_hash,
+        headers=headers,
+        connections=connections,
+        min_split_size=range_size,
+        retries=retries,
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+    )
+
+    console.print("  Verifying SHA-256...")
+    actual_hash = sha256_file(legacy_part_path)
+
+    if actual_hash != expected_hash:
+        corrupt_path = Path(f"{final_path}.corrupt")
+        corrupt_path.unlink(missing_ok=True)
+        os.replace(legacy_part_path, corrupt_path)
+        aria2_backend.remove_control_file(legacy_part_path)
+
+        raise RuntimeError(
+            f"SHA-256 mismatch: got {actual_hash}, "
+            f"expected {expected_hash}. "
+            f"Corrupt aria2 download saved as {corrupt_path.name}."
+        )
+
+    os.replace(legacy_part_path, final_path)
+    aria2_backend.remove_control_file(legacy_part_path)
+
+    console.print("  [bold green]OK[/]")
+
+
 def download_blob(
     client: RegistryClient,
     digest: str,
@@ -920,7 +1031,15 @@ def download_blob(
     lock_timeout: float,
     range_size: int,
     connections: int,
+    *,
+    backend: str = "httpx",
+    aria2_backend: Optional[Aria2Backend] = None,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_READ_TIMEOUT,
 ) -> None:
+    if backend not in {"auto", "httpx", "aria2"}:
+        raise ValueError(f"unsupported download backend: {backend}")
+
     algorithm, _, expected_hash = digest.partition(":")
 
     if algorithm != "sha256":
@@ -931,6 +1050,7 @@ def download_blob(
     final_path = blobs_dir / digest_filename(digest)
     legacy_part_path = Path(f"{final_path}.part")
     lock_path = Path(f"{final_path}.lock")
+    selected_aria2 = aria2_backend or Aria2Backend()
 
     try:
         with FileLock(str(lock_path), timeout=lock_timeout):
@@ -947,6 +1067,72 @@ def download_blob(
                 connections,
                 range_size,
             )
+
+            has_segment_state = any(
+                segment_path(final_path, segment).exists()
+                for segment in segments
+            )
+
+            if backend != "httpx":
+                if has_segment_state:
+                    if backend == "aria2":
+                        raise RuntimeError(
+                            "aria2c cannot resume existing HTTPX segment "
+                            "state; use --backend httpx to continue it"
+                        )
+
+                    console.print(
+                        "  [yellow]HTTPX segment state found; "
+                        "using HTTPX backend.[/]"
+                    )
+                elif not selected_aria2.available:
+                    if backend == "aria2":
+                        raise Aria2Error(
+                            "aria2c was not found on PATH; install aria2 "
+                            "or use --backend httpx"
+                        )
+
+                    console.print(
+                        "  [yellow]aria2c not found; "
+                        "using HTTPX backend.[/]"
+                    )
+                else:
+                    try:
+                        download_blob_with_aria2(
+                            client,
+                            selected_aria2,
+                            digest,
+                            expected_size,
+                            expected_hash,
+                            final_path,
+                            legacy_part_path,
+                            retries,
+                            range_size,
+                            connections,
+                            connect_timeout,
+                            read_timeout,
+                        )
+                        return
+                    except Aria2Error as exc:
+                        if backend == "aria2":
+                            raise
+
+                        # Convert any partial aria2 output into the legacy
+                        # sequential state that the HTTPX backend can migrate.
+                        selected_aria2.remove_control_file(legacy_part_path)
+                        console.print(
+                            f"  [yellow]aria2c failed; falling back to "
+                            f"HTTPX: {exc}[/]"
+                        )
+                    except httpx.HTTPError as exc:
+                        if backend == "aria2":
+                            raise
+
+                        selected_aria2.remove_control_file(legacy_part_path)
+                        console.print(
+                            f"  [yellow]aria2c URL setup failed; falling "
+                            f"back to HTTPX: {exc}[/]"
+                        )
 
             migrate_legacy_part(
                 legacy_part_path,
@@ -1041,13 +1227,16 @@ def download_blob(
                         cancel_futures=True,
                     )
 
-            merge_and_verify_segments(
-                final_path,
-                legacy_part_path,
-                segments,
-                expected_size,
-                expected_hash,
-            )
+            try:
+                merge_and_verify_segments(
+                    final_path,
+                    legacy_part_path,
+                    segments,
+                    expected_size,
+                    expected_hash,
+                )
+            finally:
+                selected_aria2.remove_control_file(legacy_part_path)
 
     except FileLockTimeout as exc:
         raise RuntimeError(
@@ -1082,6 +1271,16 @@ def main() -> int:
         "--registry",
         default=DEFAULT_REGISTRY,
         help=f"Registry URL (default: {DEFAULT_REGISTRY})",
+    )
+
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "httpx", "aria2"),
+        default="auto",
+        help=(
+            "Blob download backend: auto uses aria2c when available and "
+            "otherwise HTTPX (default: auto)"
+        ),
     )
 
     parser.add_argument(
@@ -1175,6 +1374,14 @@ def main() -> int:
     if args.lock_timeout < 0:
         parser.error("--lock-timeout must be >= 0")
 
+    aria2_backend = Aria2Backend()
+
+    if args.backend == "aria2" and not aria2_backend.available:
+        parser.error(
+            "--backend aria2 requires aria2c to be installed and available "
+            "on PATH"
+        )
+
     try:
         repo, tag = parse_model_ref(args.model)
     except ValueError as exc:
@@ -1205,6 +1412,16 @@ def main() -> int:
     console.print(f"[bold]Model:[/]        {repo}:{tag}")
     console.print(f"[bold]Registry:[/]     {registry}")
     console.print(f"[bold]Models dir:[/]   {models_dir}")
+    if args.backend == "auto":
+        backend_display = (
+            "auto (aria2c)"
+            if aria2_backend.available
+            else "auto (HTTPX; aria2c unavailable)"
+        )
+    else:
+        backend_display = args.backend
+
+    console.print(f"[bold]Backend:[/]      {backend_display}")
     console.print(f"[bold]Connections:[/]  {args.connections}")
     console.print(f"[bold]Range size:[/]    {args.range_size_mib} MiB")
     console.print(
@@ -1281,6 +1498,10 @@ def main() -> int:
                     args.lock_timeout,
                     range_size,
                     args.connections,
+                    backend=args.backend,
+                    aria2_backend=aria2_backend,
+                    connect_timeout=args.connect_timeout,
+                    read_timeout=args.read_timeout,
                 )
 
             except Exception:
@@ -1346,35 +1567,31 @@ if __name__ == "__main__":
         raise SystemExit(main())
 
     except KeyboardInterrupt:
-        console.print(
+        error_console.print(
             "\n[yellow]Interrupted.[/] "
             "Run the same command again to resume all segments.",
-            file=sys.stderr,
         )
         raise SystemExit(130)
 
     except httpx.HTTPStatusError as exc:
         response = exc.response
 
-        console.print(
+        error_console.print(
             f"\n[bold red]HTTP ERROR:[/] "
             f"{response.status_code} "
             f"{response.reason_phrase} "
             f"for {response.request.url}",
-            file=sys.stderr,
         )
         raise SystemExit(1)
 
     except RangeNotSupportedError as exc:
-        console.print(
+        error_console.print(
             f"\n[bold red]RANGE ERROR:[/] {exc}",
-            file=sys.stderr,
         )
         raise SystemExit(1)
 
     except Exception as exc:
-        console.print(
+        error_console.print(
             f"\n[bold red]ERROR:[/] {exc}",
-            file=sys.stderr,
         )
         raise SystemExit(1)

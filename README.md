@@ -2,6 +2,10 @@
 
 Cross-platform resumable **multi-connection** downloader for Ollama registry models.
 
+By default, the downloader uses `aria2c` for blob transfers when it is
+available on `PATH`. It automatically falls back to the built-in HTTPX
+downloader when aria2c is unavailable or cannot start a transfer.
+
 ## v4: aria2-style parallel downloads
 
 v4 can use several HTTP Range connections for a single large blob.
@@ -35,6 +39,12 @@ Windows:
 
 ```powershell
 python -m pip install -r requirements.txt
+```
+
+Optional aria2 backend:
+
+```text
+Install aria2c separately and make sure it is available on PATH.
 ```
 
 ## Download
@@ -101,6 +111,18 @@ python3 main.py qwen3.8:27b
 
 Every worker resumes its own segment from its current file size.
 
+When aria2c is used, its sequential partial file and control file are stored
+as:
+
+```text
+sha256-abc....part
+sha256-abc....part.aria2
+```
+
+Existing HTTPX segment state takes precedence in `auto` mode. Use
+`--backend httpx` to continue an existing set of `.segment-*.part` files, or
+`--backend aria2` to require aria2c for a fresh/sequential partial download.
+
 ## Upgrade from v3
 
 v3 used a single sequential file:
@@ -164,6 +186,7 @@ python3 main.py --help
 Important options:
 
 ```text
+--backend auto|httpx|aria2
 --connections N
 --range-size-mib N
 --retries N
@@ -180,6 +203,7 @@ httpx
 tenacity
 filelock
 rich
+aria2c (optional executable)
 ```
 
 ## After download
